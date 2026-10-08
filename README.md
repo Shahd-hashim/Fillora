@@ -1,4 +1,6 @@
-# Job Autofill AI
+# Fillora
+Fillora is an AI-powered browser extension that understands job application forms and intelligently completes them using information from a user's CV and personal profile. It can identify what each field is asking, retrieve the most relevant information, and generate personalized responses for complex questions based on the user's experience.
+
 
 1. Detect form fields on the page.
 2. Profile page: upload a CV, parsed via OpenRouter.
@@ -9,5 +11,3 @@
 npm install
 npm run build        # outputs to dist/
 ```
-Chrome: `chrome://extensions` -> Developer mode -> Load unpacked -> select `dist`.
-After rebuilding, press the reload icon on the extension, then reload the job page.
