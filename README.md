@@ -3,7 +3,7 @@ Fillora is an AI-powered browser extension that understands job application form
 
 
 1. Detect form fields on the page.
-2. Profile page: upload a CV, parsed via OpenRouter.
+2. Profile page: upload a CV.
 3. Autofill: obvious fields come from your profile, the rest are answered by the AI. Your stored CV is attached to resume fields, and forms inside iframes are supported.
 
 ## Run
