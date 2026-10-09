@@ -11,7 +11,7 @@ Chrome extension (TypeScript) + Python backend (FastAPI, RAG, LangChain).
 3. Autofill: obvious fields come from your profile, the rest are answered by the AI. Your stored CV is attached to resume fields, and forms inside iframes are supported.
 
 **The extension has no AI or answer logic.** It only detects form fields, fills them, and shows the UI.
-Everything else happens in the Python backend:
+Everything else happens in the backend:
 
 **The extension has no AI or answer logic.** It only detects form fields, fills them, and shows the UI.
 Everything else happens in the Python backend:
@@ -46,7 +46,6 @@ cd backend
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env               # Windows: copy .env.example .env  (then edit it)
 uvicorn main:app --port 8000
 ```
 In a second terminal: `ngrok http 8000` and copy the https URL.
