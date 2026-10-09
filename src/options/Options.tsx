@@ -2,13 +2,13 @@ import { useEffect, useRef, useState } from 'react'
 import {
   emptyEducation, emptyExperience, emptyProfile,
   type Profile,
-} from '../lib/profile'
+} from '../types'
 import {
-  DEFAULT_MODELS, getCv, getProfile, getSettings, removeCv, saveCv, saveProfile, saveSettings,
-  type Settings,
+  DEFAULT_STYLE, getCv, getProfile, getSavedAnswers, getSettings, removeCv, saveCv,
+  saveProfile, saveSettings, setSavedAnswers,
+  fileToStoredCv, type SavedAnswer, type Settings, type WritingStyle,
 } from '../lib/storage'
-import { extractCvText, fileToStoredCv } from '../lib/cv'
-import { parseCvWithLLM } from '../lib/llm'
+import { parseCv } from '../lib/api'
 
 type Status = { kind: 'idle' | 'ok' | 'error' | 'busy'; text: string }
 
@@ -36,8 +36,11 @@ function Field(props: {
 
 export default function Options() {
   const [profile, setProfile] = useState<Profile>(emptyProfile())
-  const [settings, setSettings] = useState<Settings>({ apiKey: '', models: DEFAULT_MODELS })
-  const [modelsText, setModelsText] = useState(DEFAULT_MODELS.join('\n'))
+  const [settings, setSettings] = useState<Settings>({
+    style: DEFAULT_STYLE, autoContinue: true,
+    backendUrl: '', backendSecret: '',
+  })
+  const [saved, setSaved] = useState<Array<[string, SavedAnswer]>>([])
   const [status, setStatus] = useState<Status>({ kind: 'idle', text: '' })
   const [cv, setCv] = useState<{ name: string; size: number } | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -47,9 +50,9 @@ export default function Options() {
       const [p, s] = await Promise.all([getProfile(), getSettings()])
       setProfile(p)
       setSettings(s)
-      setModelsText(s.models.join('\n'))
       const c = await getCv()
       if (c) setCv({ name: c.name, size: c.size })
+      setSaved(Object.entries(await getSavedAnswers()))
     })()
   }, [])
 
@@ -59,14 +62,16 @@ export default function Options() {
     setProfile((p) => ({ ...p, extra: { ...p.extra, [k]: v } }))
 
   const currentSettings = (): Settings => ({
-    apiKey: settings.apiKey.trim(),
-    models: modelsText.split('\n').map((m) => m.trim()).filter(Boolean),
+    ...settings,
+    backendUrl: settings.backendUrl.trim(),
+    backendSecret: settings.backendSecret.trim(),
   })
 
   const saveAll = async () => {
     const s = currentSettings()
     await saveSettings(s)
     await saveProfile(profile)
+    await setSavedAnswers(Object.fromEntries(saved))
     setSettings(s)
     setStatus({ kind: 'ok', text: 'Saved.' })
   }
@@ -76,11 +81,6 @@ export default function Options() {
     try {
       const s = currentSettings()
       await saveSettings(s)
-      setStatus({ kind: 'busy', text: 'Reading your CV…' })
-      const text = await extractCvText(file)
-      if (text.length < 30) {
-        throw new Error('No text found in this file. If it is a scanned PDF, export a text version and try again.')
-      }
       let warn = ''
       try {
         const stored = await fileToStoredCv(file)
@@ -89,9 +89,9 @@ export default function Options() {
       } catch (e) {
         warn = ' ' + (e instanceof Error ? e.message : String(e))
       }
-      setStatus({ kind: 'busy', text: 'Extracting your details with the AI model. This can take up to a minute…' })
-      const parsed = await parseCvWithLLM(s, text)
-      const next = { ...parsed, extra: profile.extra }
+      setStatus({ kind: 'busy', text: 'Reading your CV with the AI model. This can take up to a minute…' })
+      const parsed = await parseCv(s, file)
+      const next = { ...emptyProfile(), ...parsed, extra: profile.extra }
       setProfile(next)
       await saveProfile(next)
       setStatus({ kind: 'ok', text: 'CV parsed and saved. Check the fields below and fix anything that is wrong.' + warn })
@@ -118,23 +118,22 @@ export default function Options() {
       <section>
         <h2>AI connection</h2>
         <Field
-          label="OpenRouter API key"
-          type="password"
-          value={settings.apiKey}
-          onChange={(v) => setSettings((s) => ({ ...s, apiKey: v }))}
-          hint="Create one at openrouter.ai/keys. It is stored only in this browser."
+          label="Backend URL"
+          value={settings.backendUrl}
+          onChange={(v) => setSettings((s) => ({ ...s, backendUrl: v }))}
+          hint="Your Python server, for example the https URL from ngrok (run: ngrok http 8000)."
         />
-        <label className="field">
-          <span className="field-label">Models, one per line, in priority order (first 3 are used)</span>
-          <textarea rows={3} value={modelsText} onChange={(e) => setModelsText(e.target.value)} />
-          <span className="hint">
-            Free models change often. If one stops working, pick another with the :free suffix from
-            openrouter.ai/models?max_price=0.
-          </span>
-        </label>
+        <Field
+          label="Backend secret"
+          type="password"
+          value={settings.backendSecret}
+          onChange={(v) => setSettings((s) => ({ ...s, backendSecret: v }))}
+          hint="Must match BACKEND_SECRET in backend/.env."
+        />
         <p className="hint">
-          Privacy: your CV text is sent to OpenRouter and to the company running the model. Free models
-          may log prompts, so check your OpenRouter privacy settings if that matters to you.
+          The OpenRouter API key and the models are configured in backend/.env, not in the browser.
+          Privacy: your CV text is sent to your backend and from there to the company running the model.
+          Free models may log prompts, so check your OpenRouter privacy settings if that matters to you.
         </p>
       </section>
 
@@ -240,6 +239,69 @@ export default function Options() {
         <Field label="Anything else the AI should know" multiline value={profile.extra.notes}
           onChange={(v) => setExtra('notes', v)}
           hint="Preferences, gaps in your CV, how you want to come across in written answers." />
+      </section>
+
+      <section>
+        <h2>Writing style for long answers</h2>
+        <div className="grid">
+          <label className="field">
+            <span className="field-label">Tone</span>
+            <select
+              value={settings.style.tone}
+              onChange={(e) => setSettings((s) => ({ ...s, style: { ...s.style, tone: e.target.value as WritingStyle['tone'] } }))}
+            >
+              <option value="professional">Professional</option>
+              <option value="friendly">Friendly</option>
+              <option value="confident">Confident and direct</option>
+              <option value="enthusiastic">Enthusiastic</option>
+              <option value="concise">Plain and concise</option>
+            </select>
+          </label>
+          <label className="field">
+            <span className="field-label">Length</span>
+            <select
+              value={settings.style.length}
+              onChange={(e) => setSettings((s) => ({ ...s, style: { ...s.style, length: e.target.value as WritingStyle['length'] } }))}
+            >
+              <option value="short">Short (2 to 3 sentences)</option>
+              <option value="medium">Medium (4 to 6 sentences)</option>
+              <option value="long">Long (two short paragraphs)</option>
+            </select>
+          </label>
+        </div>
+        <Field
+          label="Extra instructions for the AI"
+          multiline
+          value={settings.style.extra}
+          onChange={(v) => setSettings((s) => ({ ...s, style: { ...s.style, extra: v } }))}
+          hint="For example: never say 'passionate', mention my open-source work when it fits."
+        />
+      </section>
+
+      <section>
+        <h2>Saved answers</h2>
+        <p className="hint">
+          Answers you saved from the popup. When the same question shows up again, the saved answer is used
+          instead of asking the AI. Edit or delete them here. Do not save answers that mention one specific company.
+        </p>
+        {saved.length === 0 && (
+          <p className="hint">Nothing saved yet. After an autofill, review the answers and click Save in the popup.</p>
+        )}
+        {saved.map(([key, a]) => (
+          <div className="item" key={key}>
+            <Field
+              label={a.label}
+              multiline
+              value={a.answer}
+              onChange={(v) =>
+                setSaved((list) => list.map(([k, x]) => (k === key ? ([k, { ...x, answer: v }] as [string, SavedAnswer]) : [k, x] as [string, SavedAnswer])))
+              }
+            />
+            <button className="link danger" onClick={() => setSaved((list) => list.filter(([k]) => k !== key))}>
+              Delete this answer
+            </button>
+          </div>
+        ))}
       </section>
 
       <div className="savebar">
