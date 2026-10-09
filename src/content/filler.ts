@@ -2,7 +2,12 @@ import type { FillInstruction } from '../types'
 import { getCv } from '../lib/storage'
 import { getTrigger, pickCustomOption } from './dropdown'
 
-const COLOR = { profile: '#17794a', ai: '#d98a00' }
+const COLOR = { profile: '#17794a', saved: '#17794a', ai: '#d98a00' }
+const TITLE = {
+  profile: 'Filled by Job Autofill AI from your profile.',
+  saved: 'Filled by Job Autofill AI from an answer you saved.',
+  ai: 'Filled by Job Autofill AI from an AI answer. Please review.',
+}
 
 function findEl(id: string): HTMLElement | null {
   return document.querySelector<HTMLElement>(`[data-af-id="${CSS.escape(id)}"]`)
@@ -25,16 +30,13 @@ function fire(el: HTMLElement) {
   el.dispatchEvent(new Event('blur', { bubbles: true }))
 }
 
-function mark(el: HTMLElement, source: 'profile' | 'ai') {
+function mark(el: HTMLElement, source: FillInstruction['source']) {
   const isChoice =
     el instanceof HTMLInputElement && (el.type === 'radio' || el.type === 'checkbox' || el.type === 'file')
   const target = isChoice ? ((el.closest('fieldset, label, div') as HTMLElement) ?? el) : el
   target.style.outline = `2px solid ${COLOR[source]}`
   target.style.outlineOffset = '2px'
-  target.title =
-    source === 'ai'
-      ? 'Filled by Job Autofill AI from an AI answer. Please review.'
-      : 'Filled by Job Autofill AI from your profile.'
+  target.title = TITLE[source]
 }
 
 function acceptsFile(accept: string, name: string, type: string): boolean {

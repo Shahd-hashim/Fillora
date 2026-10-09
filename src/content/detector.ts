@@ -97,6 +97,11 @@ function isRequired(el: HTMLElement): boolean {
   )
 }
 
+function maxLenOf(el: HTMLElement): number | undefined {
+  const m = (el as HTMLInputElement | HTMLTextAreaElement).maxLength
+  return typeof m === 'number' && m > 0 && m < 100000 ? m : undefined
+}
+
 function currentlyFilled(el: HTMLElement, kind: FieldKind): boolean {
   if (kind === 'checkbox') return (el as HTMLInputElement).checked
   if (kind === 'file') return ((el as HTMLInputElement).files?.length ?? 0) > 0
@@ -180,6 +185,7 @@ export function scanFields(root: Document = document): DetectedField[] {
       autocomplete: input.getAttribute('autocomplete') ?? '',
       hasValue: custom ? customHasValue(el) : currentlyFilled(el, kind),
       custom: custom || undefined,
+      maxLength: maxLenOf(el),
       options,
     })
   })
@@ -205,4 +211,31 @@ export function highlightField(id: string): boolean {
     target.style.outlineOffset = prevOffset
   }, 1800)
   return true
+}
+
+/** Current answer shown in a field, as text (used for "Save this answer"). */
+export function readFieldValue(id: string): string | null {
+  const el = document.querySelector<HTMLElement>(`[data-af-id="${CSS.escape(id)}"]`)
+  if (!el) return null
+
+  if (el instanceof HTMLInputElement && el.type === 'radio') {
+    const group = el.name
+      ? Array.from(document.querySelectorAll<HTMLInputElement>(`input[type="radio"][name="${CSS.escape(el.name)}"]`))
+      : [el]
+    const on = group.find((r) => r.checked)
+    return on ? ownLabel(on) || on.value : null
+  }
+  if (el instanceof HTMLInputElement && el.type === 'checkbox') return el.checked ? 'true' : 'false'
+  if (el instanceof HTMLSelectElement) {
+    const o = el.selectedOptions[0]
+    return o && el.value !== '' ? clean(o.textContent) : null
+  }
+  if (isCustomDropdown(el)) {
+    if (!customHasValue(el)) return null
+    const t = getTrigger(el)
+    const input = el instanceof HTMLInputElement ? el : t.querySelector('input')
+    return clean(input?.value || t.textContent) || null
+  }
+  const v = (el as HTMLInputElement | HTMLTextAreaElement).value
+  return v && v.trim() ? v.trim() : null
 }
