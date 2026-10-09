@@ -1,32 +1,91 @@
 import type {
-  AutofillResponse, DetectedField, FillInstruction, FillResult, Message, ScanResponse,
+  AutofillItem, AutofillResponse, DetectedField, FillInstruction, FillResult, Message, PageContext, ScanResponse,
 } from '../types'
-import { getCv, getProfile, getSettings } from '../lib/storage'
-import { ruleAnswer } from '../lib/rules'
-import { aiAnswers, matchOption, type AiAnswer } from '../lib/answer'
+import { getCv, getProfile, getSavedAnswers, getSettings } from '../lib/storage'
+import { autofill, backendEnabled } from '../lib/api'
 
-const CONSENT = /(agree|terms|privacy|consent|acknowledg|certify|gdpr|policy|accept)/i
 const CV_FIELD = /\b(resume|résumé|cv|curriculum)\b/i
 const OTHER_FILE = /(cover|letter|transcript|portfolio|photo|certificate|reference|id card|passport)/i
-const MAX_AI_FIELDS = 40
 
 const frameOf = new Map<string, number>() // field id -> frame id (ids are unique across frames)
+const running = new Set<number>()         // tabs with an autofill in progress
 
-chrome.runtime.onMessage.addListener((msg: Message, _sender, sendResponse) => {
-  if (msg.type === 'AUTOFILL') {
-    runAutofill(msg.tabId)
-      .then(sendResponse)
-      .catch((e) => sendResponse({ results: [], error: e instanceof Error ? e.message : String(e) }))
-    return true // keep the channel open for the async answer
+interface LastRun {
+  fields: DetectedField[]
+  results: FillResult[]
+  page: PageContext
+  aiError?: string
+}
+
+const lastKey = (tabId: number) => `lastRun:${tabId}`
+const saveLastRun = (tabId: number, run: LastRun) => chrome.storage.session.set({ [lastKey(tabId)]: run })
+async function loadLastRun(tabId: number): Promise<LastRun | null> {
+  const o = await chrome.storage.session.get(lastKey(tabId))
+  return o[lastKey(tabId)] ?? null
+}
+
+async function watchedTabs(): Promise<number[]> {
+  const { watchTabs } = await chrome.storage.session.get('watchTabs')
+  return watchTabs ?? []
+}
+
+const errText = (e: unknown) => (e instanceof Error ? e.message : String(e))
+
+chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
+  switch (msg.type) {
+    case 'AUTOFILL':
+      guarded(msg.tabId, () => runAutofill(msg.tabId))
+        .then(sendResponse)
+        .catch((e) => sendResponse({ results: [], error: errText(e) }))
+      return true
+    case 'SCAN_ALL':
+      scanAll(msg.tabId)
+        .then(sendResponse)
+        .catch((e) => sendResponse({ fields: [], page: { title: '', url: '', text: '' }, error: errText(e) }))
+      return true
+    case 'REGENERATE':
+      regenerate(msg.tabId, msg.id).then(sendResponse).catch((e) => sendResponse({ error: errText(e) }))
+      return true
+    case 'SET_AUTO_CONTINUE':
+      setAutoContinue(msg.tabId, msg.on).then(() => sendResponse({ ok: true })).catch(() => sendResponse({ ok: false }))
+      return true
+    case 'IS_WATCHING': {
+      const tabId = sender.tab?.id
+      if (tabId === undefined) { sendResponse({ watching: false }); return false }
+      Promise.all([watchedTabs(), getSettings()])
+        .then(([tabs, s]) => sendResponse({ watching: s.autoContinue && tabs.includes(tabId) }))
+        .catch(() => sendResponse({ watching: false }))
+      return true
+    }
+    case 'AUTO_RESCAN': {
+      const tabId = sender.tab?.id
+      if (tabId === undefined) return false
+      Promise.all([watchedTabs(), getSettings()]).then(([tabs, s]) => {
+        if (!s.autoContinue || !tabs.includes(tabId) || running.has(tabId)) return
+        guarded(tabId, () => runAutofill(tabId, { auto: true })).catch(() => {})
+      })
+      return false
+    }
+    default:
+      return false
   }
-  if (msg.type === 'SCAN_ALL') {
-    scanAll(msg.tabId)
-      .then(sendResponse)
-      .catch((e) => sendResponse({ fields: [], page: { title: '', url: '', text: '' }, error: e instanceof Error ? e.message : String(e) }))
-    return true
-  }
-  return false
 })
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const tabs = await watchedTabs()
+  await chrome.storage.session.set({ watchTabs: tabs.filter((t) => t !== tabId) })
+  await chrome.storage.session.remove(lastKey(tabId))
+})
+
+async function guarded<T>(tabId: number, fn: () => Promise<T>): Promise<T> {
+  if (running.has(tabId)) throw new Error('Already filling this page. Wait a moment.')
+  running.add(tabId)
+  try {
+    return await fn()
+  } finally {
+    running.delete(tabId)
+  }
+}
 
 async function frameIds(tabId: number): Promise<number[]> {
   try {
@@ -68,34 +127,58 @@ async function scanAll(tabId: number): Promise<ScanResponse> {
   return { fields, page: top.res.page }
 }
 
+// ---------- multi-step watching ----------
+
+async function startWatch(tabId: number, fields: DetectedField[]) {
+  const tabs = await watchedTabs()
+  if (!tabs.includes(tabId)) await chrome.storage.session.set({ watchTabs: [...tabs, tabId] })
+
+  const idsByFrame = new Map<number, string[]>()
+  for (const f of fields) {
+    const fid = f.frameId ?? 0
+    idsByFrame.set(fid, [...(idsByFrame.get(fid) ?? []), f.id])
+  }
+  for (const frameId of await frameIds(tabId)) {
+    const msg: Message = { type: 'WATCH_START', handledIds: idsByFrame.get(frameId) ?? [] }
+    try { await chrome.tabs.sendMessage(tabId, msg, { frameId }) } catch { /* frame has no script */ }
+  }
+}
+
+async function stopWatch(tabId: number) {
+  const tabs = await watchedTabs()
+  await chrome.storage.session.set({ watchTabs: tabs.filter((t) => t !== tabId) })
+  for (const frameId of await frameIds(tabId)) {
+    const msg: Message = { type: 'WATCH_STOP' }
+    try { await chrome.tabs.sendMessage(tabId, msg, { frameId }) } catch { /* ignore */ }
+  }
+}
+
+async function setAutoContinue(tabId: number, on: boolean) {
+  if (on) {
+    const scan = await scanAll(tabId)
+    await startWatch(tabId, scan.fields)
+  } else {
+    for (const t of await watchedTabs()) await stopWatch(t)
+  }
+}
+
+// ---------- answers ----------
+
 const skip = (f: DetectedField, note: string): FillResult => ({
   id: f.id, label: f.label, answer: '', source: 'skipped', note,
 })
 
-/** Turn an answer into something the page can apply. Returns null if it cannot be applied. */
-function toFill(
-  f: DetectedField, answer: AiAnswer, source: 'profile' | 'ai',
-): { fill: FillInstruction; shown: string } | null {
-  if (answer === null || answer === '') return null
-
-  if (f.kind === 'checkbox') {
-    const checked = answer === true || /^(true|yes)$/i.test(String(answer))
-    return { fill: { id: f.id, kind: f.kind, value: '', checked, source }, shown: checked ? 'Checked' : 'Unchecked' }
+/** Turn the backend's answer for a field into an instruction the page can apply. */
+function toInstruction(f: DetectedField, r: AutofillItem): FillInstruction {
+  return {
+    id: f.id,
+    kind: f.kind,
+    value: r.value,
+    optionId: r.optionId ?? undefined,
+    checked: r.checked ?? undefined,
+    custom: f.custom,
+    source: r.source as FillInstruction['source'],
   }
-  if (f.kind === 'select' || f.kind === 'radio') {
-    const opt = matchOption(String(answer), f.options ?? [])
-    if (!opt) return null
-    return {
-      fill: {
-        id: f.id, kind: f.kind, value: opt.value,
-        optionId: f.kind === 'radio' ? opt.id : undefined,
-        custom: f.custom, source,
-      },
-      shown: opt.text || opt.value,
-    }
-  }
-  const text = String(answer)
-  return { fill: { id: f.id, kind: f.kind, value: text, source }, shown: text }
 }
 
 function summaryFor(fills: FillInstruction[]): string {
@@ -107,8 +190,10 @@ function summaryFor(fills: FillInstruction[]): string {
   )
 }
 
-async function runAutofill(tabId: number): Promise<AutofillResponse> {
-  const [profile, settings, cv] = await Promise.all([getProfile(), getSettings(), getCv()])
+async function runAutofill(tabId: number, opts: { auto?: boolean } = {}): Promise<AutofillResponse> {
+  const [profile, settings, cv, saved] = await Promise.all([
+    getProfile(), getSettings(), getCv(), getSavedAnswers(),
+  ])
   if (!profile.fullName && !profile.email) {
     throw new Error('Your profile is empty. Open Profile and upload your CV first.')
   }
@@ -117,7 +202,7 @@ async function runAutofill(tabId: number): Promise<AutofillResponse> {
 
   const results: FillResult[] = []
   const fills: FillInstruction[] = []
-  const needAi: DetectedField[] = []
+  const toSend: DetectedField[] = [] // everything the backend should answer
 
   const emptyFileFields = scan.fields.filter((x) => x.kind === 'file' && !x.hasValue)
   const soleFile = emptyFileFields.length === 1
@@ -137,8 +222,6 @@ async function runAutofill(tabId: number): Promise<AutofillResponse> {
       continue
     }
 
-    if (f.kind === 'date') { results.push(skip(f, 'Fill dates yourself')); continue }
-
     if (f.custom && !f.options?.length) {
       try {
         const m: Message = { type: 'READ_OPTIONS', id: f.id }
@@ -154,47 +237,29 @@ async function runAutofill(tabId: number): Promise<AutofillResponse> {
       }
     }
 
-    if (f.kind === 'checkbox' && /^(check ?box( label)?|label)$/i.test(f.label.trim())) {
-      results.push(skip(f, 'Unclear label, left for you')); continue
-    }
-    if (f.kind === 'checkbox' && CONSENT.test(f.label)) {
-      results.push(skip(f, 'Left for you to confirm')); continue
-    }
-
-    const rule = ruleAnswer(f, profile)
-    if (rule) {
-      const r = toFill(f, rule, 'profile')
-      if (r) {
-        fills.push(r.fill)
-        results.push({ id: f.id, label: f.label, answer: r.shown, source: 'profile' })
-        continue
-      }
-    }
-    needAi.push(f)
+    toSend.push(f)
   }
 
   let aiError: string | undefined
-  const batch = needAi.slice(0, MAX_AI_FIELDS)
-  for (const f of needAi.slice(MAX_AI_FIELDS)) results.push(skip(f, 'Too many fields for one run'))
-
-  if (batch.length) {
-    if (!settings.apiKey) {
-      aiError = 'No API key set, so the open questions were skipped.'
-      for (const f of batch) results.push(skip(f, 'Needs the AI'))
+  if (toSend.length) {
+    if (!backendEnabled(settings)) {
+      aiError = 'No Backend URL set. Add it on the Profile page.'
+      for (const f of toSend) results.push(skip(f, 'Needs the backend'))
     } else {
       try {
-        const answers = await aiAnswers(settings, profile, scan.page, batch)
-        for (const f of batch) {
-          const ans = answers[f.id]
-          if (ans === null || ans === '') { results.push(skip(f, 'Not enough info in your profile')); continue }
-          const r = toFill(f, ans, 'ai')
-          if (!r) { results.push(skip(f, "Couldn't match one of the options")); continue }
-          fills.push(r.fill)
-          results.push({ id: f.id, label: f.label, answer: r.shown, source: 'ai' })
+        const reply = await autofill(settings, { profile, page: scan.page, fields: toSend, saved })
+        if (reply.ai_error) aiError = reply.ai_error
+        const byId = new Map(toSend.map((f) => [f.id, f]))
+        for (const r of reply.results) {
+          const f = byId.get(r.id)
+          if (!f) continue
+          if (r.source === 'skipped') { results.push(skip(f, r.note)); continue }
+          fills.push(toInstruction(f, r))
+          results.push({ id: f.id, label: f.label, answer: r.shown, source: r.source })
         }
       } catch (e) {
-        aiError = e instanceof Error ? e.message : String(e)
-        for (const f of batch) results.push(skip(f, 'AI request failed'))
+        aiError = errText(e)
+        for (const f of toSend) results.push(skip(f, 'Backend request failed'))
       }
     }
   }
@@ -223,5 +288,45 @@ async function runAutofill(tabId: number): Promise<AutofillResponse> {
     }
   }
 
+  for (const r of results) r.frameId = frameOf.get(r.id)
+  await saveLastRun(tabId, { fields: scan.fields, results, page: scan.page, aiError })
+
+  // Keep an eye out for the next step of a multi-step form
+  if (!opts.auto && settings.autoContinue) await startWatch(tabId, scan.fields)
+
   return { results, aiError }
+}
+
+/** Write a new answer for one field, replacing what is on the page. */
+async function regenerate(tabId: number, id: string): Promise<{ result?: FillResult; error?: string }> {
+  const run = await loadLastRun(tabId)
+  const field = run?.fields.find((f) => f.id === id)
+  if (!run || !field) return { error: 'This field is no longer available. Run Autofill again.' }
+
+  const [profile, settings] = await Promise.all([getProfile(), getSettings()])
+  if (!backendEnabled(settings)) return { error: 'Set the Backend URL on the Profile page first.' }
+
+  const prev = run.results.find((r) => r.id === id)
+  const reply = await autofill(settings, {
+    profile, page: run.page, fields: [field], aiOnly: true, avoid: { [id]: prev?.answer ?? '' },
+  })
+  const item = reply.results[0]
+  if (!item || item.source === 'skipped') {
+    return { error: item?.note || reply.ai_error || 'The AI had no answer for this field.' }
+  }
+  const r = { fill: toInstruction(field, item), shown: item.shown }
+
+  const frameId = field.frameId ?? 0
+  const msg: Message = { type: 'FILL_FIELDS', fills: [r.fill], summary: 'Wrote a new answer. Please review it.' }
+  let res: { filled: number; failed: string[] } | undefined
+  try {
+    res = await chrome.tabs.sendMessage(tabId, msg, { frameId })
+  } catch {
+    return { error: "Can't reach the page. Reload it and run Autofill again." }
+  }
+  if (res?.failed?.length) return { error: "Couldn't apply the new answer on the page." }
+
+  const result: FillResult = { id, label: field.label, answer: r.shown, source: 'ai', frameId }
+  await saveLastRun(tabId, { ...run, results: run.results.map((x) => (x.id === id ? result : x)) })
+  return { result }
 }
